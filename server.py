@@ -23,25 +23,63 @@ def ollama(image_data, vitals):
     with urllib.request.urlopen(req,timeout=180) as r: raw=json.loads(r.read())
     out=json.loads(raw.get('response','{}')); out['mode']='ollama'; out['model']=OLLAMA_MODEL; return out
 
+def _parse_json_from_model_text(text):
+    """Parse JSON robustly and return a useful error when a model replies with empty/non-JSON text."""
+    if text is None:
+        raise ValueError('The LLM returned no message content.')
+    if isinstance(text, list):
+        text=''.join(x.get('text','') if isinstance(x,dict) else str(x) for x in text)
+    text=str(text).strip()
+    if not text:
+        raise ValueError('The LLM returned an empty response. Try again or use another available vision model.')
+    if text.startswith('```'):
+        lines=text.splitlines()
+        if lines and lines[0].startswith('```'): lines=lines[1:]
+        if lines and lines[-1].strip().startswith('```'): lines=lines[:-1]
+        text='\n'.join(lines).strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # Extract the first JSON object when the model adds explanatory text.
+        first=text.find('{'); last=text.rfind('}')
+        if first >= 0 and last > first:
+            try: return json.loads(text[first:last+1])
+            except json.JSONDecodeError: pass
+        raise ValueError('The LLM returned non-JSON content: '+text[:500])
+
 def openrouter(image_data, vitals):
     if not OPENROUTER_KEY: raise RuntimeError('OPENROUTER_API_KEY is not configured.')
     if not image_data or ',' not in image_data: raise ValueError('A captured or uploaded image is required.')
-    prompt=SYSTEM+'\n\nUser-entered vitals: '+json.dumps(vitals)+'\nAnalyze the image and vitals within the stated limits. Return JSON only.'
+    prompt=SYSTEM+'\n\nUser-entered vitals: '+json.dumps(vitals)+'\nReturn one valid JSON object only. Do not use markdown or code fences.'
     payload={
       'model':OPENROUTER_MODEL,
       'messages':[{'role':'user','content':[{'type':'text','text':prompt},{'type':'image_url','image_url':{'url':image_data}}]}],
       'temperature':0.2,
       'max_tokens':900
     }
-    req=urllib.request.Request('https://openrouter.ai/api/v1/chat/completions',data=json.dumps(payload).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+OPENROUTER_KEY,'HTTP-Referer':'http://localhost','X-Title':'Wellness School Project'})
-    with urllib.request.urlopen(req,timeout=180) as r: raw=json.loads(r.read())
-    text=raw['choices'][0]['message']['content']
-    if isinstance(text,list): text=''.join(x.get('text','') if isinstance(x,dict) else str(x) for x in text)
-    text=str(text).strip()
-    if text.startswith('```'):
-        text=text.split('\n',1)[1] if '\n' in text else text
-        text=text.rsplit('```',1)[0].strip()
-    out=json.loads(text); out['mode']='openrouter'; out['model']=OPENROUTER_MODEL; return out
+    req=urllib.request.Request('https://openrouter.ai/api/v1/chat/completions',data=json.dumps(payload).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+OPENROUTER_KEY,'HTTP-Referer':'https://wellness-school-project.example','X-Title':'Wellness School Project'})
+    try:
+        with urllib.request.urlopen(req,timeout=180) as r:
+            raw_bytes=r.read(); status=r.status
+    except urllib.error.HTTPError as e:
+        detail=e.read().decode('utf-8','replace')
+        raise RuntimeError('OpenRouter HTTP %s: %s' % (e.code, detail[:1200]))
+    except urllib.error.URLError as e:
+        raise RuntimeError('OpenRouter connection error: '+str(e.reason))
+    raw_text=raw_bytes.decode('utf-8','replace').strip()
+    if not raw_text:
+        raise RuntimeError('OpenRouter returned an empty HTTP response.')
+    try:
+        raw=json.loads(raw_text)
+    except json.JSONDecodeError:
+        raise RuntimeError('OpenRouter returned non-JSON HTTP content: '+raw_text[:500])
+    choices=raw.get('choices') or []
+    if not choices:
+        raise RuntimeError('OpenRouter response contains no choices: '+json.dumps(raw)[:1000])
+    message=choices[0].get('message') or {}
+    out=_parse_json_from_model_text(message.get('content'))
+    out['mode']='openrouter'; out['model']=raw.get('model',OPENROUTER_MODEL)
+    return out
 
 def analyze(image, vitals):
     errors=[]
