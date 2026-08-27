@@ -1,114 +1,265 @@
-import os, json, socket, urllib.request, urllib.error
-from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
-from pathlib import Path
 
-ROOT=Path(__file__).parent
-OLLAMA_URL=os.getenv('OLLAMA_URL','http://127.0.0.1:11434/api/generate')
-OLLAMA_MODEL=os.getenv('OLLAMA_MODEL','llava')
-OPENROUTER_KEY=os.getenv('OPENROUTER_API_KEY','')
-OPENROUTER_MODEL=os.getenv('OPENROUTER_MODEL','openrouter/free')
-PROVIDER=os.getenv('LLM_PROVIDER','openrouter').lower()  # openrouter | ollama | auto
+import os, json, base64, re, logging
+from flask import Flask, request, jsonify, send_from_directory
+import requests
 
-SYSTEM='''You are an educational wellness assistant. Review a user-provided image and optional user-entered vital measurements. Do not identify the person. Do not diagnose diseases, estimate medical conditions, or infer sensitive traits, emotions, personality, age, ethnicity, or other health conditions from appearance. Do not claim that vitals were measured from the image. Only describe clearly visible, non-sensitive features relevant to image usability and general wellness context, such as lighting, blur, obstruction, and whether the image appears to show a person. Combine this cautiously with the user-entered vitals. Return STRICT JSON with keys: image_observations (array of strings), wellness_summary (string), recommendations (array of strings), limitations (string). Keep recommendations general and educational. If vital values are concerning, recommend seeking advice from a qualified healthcare professional rather than diagnosing.'''
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+app = Flask(__name__, static_folder=".", static_url_path="")
 
-def demo():
-    return {'mode':'demo','image_observations':['Image was received, but no LLM analysis was available.'], 'wellness_summary':'The project can still demonstrate the workflow, but this result is not an AI image analysis.', 'recommendations':['Configure a free LLM provider to enable multimodal image analysis.'], 'limitations':'Demo fallback only; not medical advice or diagnosis.'}
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+MODELS_URL = "https://openrouter.ai/api/v1/models"
 
-def ollama(image_data, vitals):
-    if not image_data or ',' not in image_data: raise ValueError('A captured or uploaded image is required.')
-    b64=image_data.split(',',1)[1]
-    prompt=SYSTEM+'\n\nUser-entered vitals: '+json.dumps(vitals)+'\nReturn JSON only.'
-    payload={'model':OLLAMA_MODEL,'prompt':prompt,'images':[b64],'stream':False,'format':'json'}
-    req=urllib.request.Request(OLLAMA_URL,data=json.dumps(payload).encode(),headers={'Content-Type':'application/json'})
-    with urllib.request.urlopen(req,timeout=180) as r: raw=json.loads(r.read())
-    out=json.loads(raw.get('response','{}')); out['mode']='ollama'; out['model']=OLLAMA_MODEL; return out
+def cfg(name, default=None):
+    return os.environ.get(name, default)
 
-def _parse_json_from_model_text(text):
-    """Parse JSON robustly and return a useful error when a model replies with empty/non-JSON text."""
-    if text is None:
-        raise ValueError('The LLM returned no message content.')
-    if isinstance(text, list):
-        text=''.join(x.get('text','') if isinstance(x,dict) else str(x) for x in text)
-    text=str(text).strip()
+def safe_error(resp):
+    try:
+        data = resp.json()
+        return data.get("error", {}).get("message") or data.get("message") or json.dumps(data)[:1000]
+    except Exception:
+        return (resp.text or "Empty non-JSON response")[:1000]
+
+def normalize_image(data_url):
+    if not isinstance(data_url, str) or not data_url.startswith("data:image/"):
+        raise ValueError("A valid image data URL is required.")
+    head, b64 = data_url.split(",", 1)
+    mime = head.split(";")[0].replace("data:", "").lower()
+    if mime not in {"image/jpeg", "image/png", "image/webp", "image/gif"}:
+        raise ValueError("Supported image formats: JPEG, PNG, WEBP, GIF.")
+    raw = base64.b64decode(b64, validate=True)
+    if len(raw) > 8 * 1024 * 1024:
+        raise ValueError("Image is too large. Please use an image under 8 MB.")
+    return data_url
+
+def extract_json(text):
     if not text:
-        raise ValueError('The LLM returned an empty response. Try again or use another available vision model.')
-    if text.startswith('```'):
-        lines=text.splitlines()
-        if lines and lines[0].startswith('```'): lines=lines[1:]
-        if lines and lines[-1].strip().startswith('```'): lines=lines[:-1]
-        text='\n'.join(lines).strip()
+        return None
+    text = text.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
+        text = re.sub(r"\s*```$", "", text)
     try:
         return json.loads(text)
-    except json.JSONDecodeError:
-        # Extract the first JSON object when the model adds explanatory text.
-        first=text.find('{'); last=text.rfind('}')
-        if first >= 0 and last > first:
-            try: return json.loads(text[first:last+1])
-            except json.JSONDecodeError: pass
-        raise ValueError('The LLM returned non-JSON content: '+text[:500])
+    except Exception:
+        pass
+    # Find the first balanced object, accounting for quoted strings.
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth, in_str, esc = 0, False, False
+    for i, ch in enumerate(text[start:], start):
+        if in_str:
+            if esc: esc = False
+            elif ch == "\\": esc = True
+            elif ch == '"': in_str = False
+        else:
+            if ch == '"': in_str = True
+            elif ch == "{": depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start:i+1])
+                    except Exception:
+                        return None
+    return None
 
-def openrouter(image_data, vitals):
-    if not OPENROUTER_KEY: raise RuntimeError('OPENROUTER_API_KEY is not configured.')
-    if not image_data or ',' not in image_data: raise ValueError('A captured or uploaded image is required.')
-    prompt=SYSTEM+'\n\nUser-entered vitals: '+json.dumps(vitals)+'\nReturn one valid JSON object only. Do not use markdown or code fences.'
-    payload={
-      'model':OPENROUTER_MODEL,
-      'messages':[{'role':'user','content':[{'type':'text','text':prompt},{'type':'image_url','image_url':{'url':image_data}}]}],
-      'temperature':0.2,
-      'max_tokens':900
+def build_prompt(vitals):
+    return f"""
+You are an educational wellness observation assistant for a school demonstration.
+Analyze ONLY visible, non-sensitive wellness-related appearance cues in the supplied image,
+and combine them with the user-entered measurements below.
+
+IMPORTANT SAFETY RULES:
+- Do not diagnose diseases, medical conditions, deficiencies, or mental health conditions.
+- Do not infer a person's identity, age, ethnicity, religion, or other sensitive traits.
+- Do not claim that facial appearance proves sleep quality, hydration status, anemia, infection,
+  stress level, or any medical condition.
+- Treat measurements as user-entered data; do not validate or diagnose from them.
+- If the image is unclear, say so.
+- Keep language supportive, neutral, and educational.
+- State that photo observations are not a medical assessment.
+- Do not provide emergency instructions or certainty-based medical conclusions.
+
+User-entered wellness measurements:
+BMI: {vitals.get("bmi", "Not provided")}
+Blood pressure: {vitals.get("blood_pressure", "Not provided")}
+SpO2: {vitals.get("spo2", "Not provided")}
+Resting pulse: {vitals.get("pulse", "Not provided")}
+Temperature: {vitals.get("temperature", "Not provided")}
+
+Return ONLY valid JSON using exactly this structure:
+{{
+  "image_quality": "good|fair|poor",
+  "image_observations": ["2 to 4 careful visual observations limited to what is visible"],
+  "vitals_summary": "Brief neutral summary of the values supplied by the user; do not diagnose.",
+  "wellness_focus": ["2 to 4 general wellness areas"],
+  "suggestions": ["3 to 5 general, low-risk wellness suggestions"],
+  "limitations": "Photo-based observations are informational only and are not a medical assessment."
+}}
+""".strip()
+
+def call_openrouter(image_data_url, vitals):
+    api_key = cfg("OPENROUTER_API_KEY", "").strip()
+    model = cfg("OPENROUTER_MODEL", "openrouter/free").strip() or "openrouter/free"
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY is not configured on the server.")
+
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "system",
+                "content": "You follow the user's requested JSON schema exactly. Never diagnose from an image."
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": build_prompt(vitals)},
+                    {"type": "image_url", "image_url": {"url": image_data_url}}
+                ]
+            }
+        ],
+        "temperature": 0.2,
+        "max_tokens": 700,
+        "stream": False
     }
-    req=urllib.request.Request('https://openrouter.ai/api/v1/chat/completions',data=json.dumps(payload).encode(),headers={'Content-Type':'application/json','Authorization':'Bearer '+OPENROUTER_KEY,'HTTP-Referer':'https://wellness-school-project.example','X-Title':'Wellness School Project'})
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "X-OpenRouter-Metadata": "enabled",
+        "HTTP-Referer": cfg("APP_URL", "https://example.invalid"),
+        "X-Title": "Wellness Tool School Demo"
+    }
+
     try:
-        with urllib.request.urlopen(req,timeout=180) as r:
-            raw_bytes=r.read(); status=r.status
-    except urllib.error.HTTPError as e:
-        detail=e.read().decode('utf-8','replace')
-        raise RuntimeError('OpenRouter HTTP %s: %s' % (e.code, detail[:1200]))
-    except urllib.error.URLError as e:
-        raise RuntimeError('OpenRouter connection error: '+str(e.reason))
-    raw_text=raw_bytes.decode('utf-8','replace').strip()
-    if not raw_text:
-        raise RuntimeError('OpenRouter returned an empty HTTP response.')
+        response = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=90)
+    except requests.RequestException as e:
+        raise RuntimeError(f"Network request to OpenRouter failed: {type(e).__name__}: {e}")
+
+    if not response.ok:
+        msg = safe_error(response)
+        logging.error("OpenRouter HTTP %s: %s", response.status_code, msg)
+        raise RuntimeError(f"OpenRouter HTTP {response.status_code}: {msg}")
+
     try:
-        raw=json.loads(raw_text)
-    except json.JSONDecodeError:
-        raise RuntimeError('OpenRouter returned non-JSON HTTP content: '+raw_text[:500])
-    choices=raw.get('choices') or []
+        result = response.json()
+    except Exception:
+        body = (response.text or "").strip()
+        logging.error("OpenRouter returned non-JSON response: %s", body[:1000])
+        raise RuntimeError("OpenRouter returned a non-JSON response.")
+
+    choices = result.get("choices") or []
     if not choices:
-        raise RuntimeError('OpenRouter response contains no choices: '+json.dumps(raw)[:1000])
-    message=choices[0].get('message') or {}
-    out=_parse_json_from_model_text(message.get('content'))
-    out['mode']='openrouter'; out['model']=raw.get('model',OPENROUTER_MODEL)
-    return out
+        raise RuntimeError(f"OpenRouter returned no choices: {json.dumps(result)[:1000]}")
 
-def analyze(image, vitals):
-    errors=[]
-    if PROVIDER in ('openrouter','auto'):
-        try: return openrouter(image,vitals)
-        except Exception as e: errors.append('OpenRouter: '+str(e))
-        if PROVIDER=='openrouter': raise RuntimeError('; '.join(errors))
-    if PROVIDER in ('ollama','auto'):
-        try: return ollama(image,vitals)
-        except Exception as e: errors.append('Ollama: '+str(e))
-    raise RuntimeError('; '.join(errors) or 'No LLM provider configured.')
+    message = choices[0].get("message") or {}
+    content = message.get("content")
+    if isinstance(content, list):
+        content = "".join(str(x.get("text", "")) for x in content if isinstance(x, dict))
+    content = (content or "").strip()
+    if not content:
+        raise RuntimeError("OpenRouter returned an empty analysis.")
 
-class Handler(SimpleHTTPRequestHandler):
-    def do_POST(self):
-        if self.path!='/api/wellness-analysis': self.send_error(404); return
-        try:
-            n=int(self.headers.get('Content-Length','0')); data=json.loads(self.rfile.read(n))
-            try: result=analyze(data.get('image'),data.get('vitals',{}))
-            except Exception as e:
-                if os.getenv('DEMO_FALLBACK','false').lower()=='true': result=demo(); result['llm_error']=str(e)
-                else: raise
-            body=json.dumps(result).encode(); self.send_response(200); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body)
-        except Exception as e:
-            body=json.dumps({'error':str(e)}).encode(); self.send_response(500); self.send_header('Content-Type','application/json'); self.end_headers(); self.wfile.write(body)
+    parsed = extract_json(content)
+    if parsed is None:
+        parsed = {
+            "image_quality": "fair",
+            "image_observations": ["The model returned a narrative response instead of the requested structured format."],
+            "vitals_summary": "User-entered measurements were included in the AI request.",
+            "wellness_focus": ["General wellness awareness"],
+            "suggestions": [],
+            "limitations": "Photo-based observations are informational only and are not a medical assessment.",
+            "raw_model_response": content
+        }
 
-if __name__=='__main__':
-    os.chdir(ROOT); port=int(os.getenv('PORT','8000'))
-    print('Wellness Tool running at http://localhost:%s' % port)
-    print('LLM provider:', PROVIDER)
-    if PROVIDER in ('openrouter','auto'):
-        print('OpenRouter model:', OPENROUTER_MODEL, '| key configured:', bool(OPENROUTER_KEY))
-    ThreadingHTTPServer(('0.0.0.0',port),Handler).serve_forever()
+    return {
+        "analysis": parsed,
+        "model_requested": model,
+        "model_used": result.get("model", model),
+        "request_id": result.get("id")
+    }
+
+def demo_analysis(vitals):
+    return {
+        "image_quality": "not AI-verified",
+        "image_observations": ["Demo fallback is active; no live AI image interpretation was returned."],
+        "vitals_summary": "Values received: " + ", ".join(
+            f"{k}={v}" for k, v in vitals.items() if v not in (None, "", "Not provided")
+        ) if any(v not in (None, "", "Not provided") for v in vitals.values())
+        else "No measurements were provided.",
+        "wellness_focus": ["General wellness awareness"],
+        "suggestions": ["Use the live LLM result when available; this fallback is for interface demonstration only."],
+        "limitations": "Demo fallback only. This is not AI image analysis and is not a medical assessment."
+    }
+
+@app.get("/")
+def home():
+    return send_from_directory(".", "index.html")
+
+@app.get("/manifest.json")
+def manifest():
+    return send_from_directory(".", "manifest.json")
+
+@app.get("/api/llm-status")
+def llm_status():
+    api_key = cfg("OPENROUTER_API_KEY", "").strip()
+    model = cfg("OPENROUTER_MODEL", "openrouter/free").strip() or "openrouter/free"
+    status = {
+        "provider": cfg("LLM_PROVIDER", "openrouter"),
+        "model": model,
+        "api_key_configured": bool(api_key),
+        "connectivity": "not_tested",
+        "detail": ""
+    }
+    if not api_key:
+        status["connectivity"] = "failed"
+        status["detail"] = "OPENROUTER_API_KEY is not configured."
+        return jsonify(status), 503
+    try:
+        r = requests.get(MODELS_URL, headers={"Authorization": f"Bearer {api_key}"}, timeout=20)
+        if r.ok:
+            status["connectivity"] = "reachable"
+            status["detail"] = "OpenRouter API is reachable. This check does not consume a chat completion."
+            return jsonify(status)
+        status["connectivity"] = "failed"
+        status["detail"] = f"OpenRouter HTTP {r.status_code}: {safe_error(r)}"
+        return jsonify(status), 503
+    except requests.RequestException as e:
+        status["connectivity"] = "failed"
+        status["detail"] = f"Network error: {type(e).__name__}: {e}"
+        return jsonify(status), 503
+
+@app.post("/api/wellness-analysis")
+def wellness_analysis():
+    try:
+        data = request.get_json(force=True, silent=False) or {}
+        image = normalize_image(data.get("image", ""))
+        vitals = data.get("vitals") or {}
+        vitals = {
+            "bmi": vitals.get("bmi", "Not provided"),
+            "blood_pressure": vitals.get("blood_pressure", "Not provided"),
+            "spo2": vitals.get("spo2", "Not provided"),
+            "pulse": vitals.get("pulse", "Not provided"),
+            "temperature": vitals.get("temperature", "Not provided"),
+        }
+        result = call_openrouter(image, vitals)
+        return jsonify({"ok": True, "source": "live_llm", **result})
+    except Exception as e:
+        detail = str(e)
+        logging.exception("Wellness analysis failed: %s", detail)
+        if cfg("DEMO_FALLBACK", "false").lower() == "true":
+            data = request.get_json(silent=True) or {}
+            vitals = (data.get("vitals") or {})
+            return jsonify({
+                "ok": True,
+                "source": "demo_fallback",
+                "warning": "Live LLM analysis was unavailable. Demo fallback was used.",
+                "live_error": detail,
+                "analysis": demo_analysis(vitals)
+            })
+        return jsonify({"ok": False, "error": detail}), 502
+
+if __name__ == "__main__":
+    port = int(cfg("PORT", "10000"))
+    app.run(host="0.0.0.0", port=port)
